@@ -12,7 +12,7 @@ module.exports = [
     {
         zigbeeModel: ['4512770'],
         model: '4512770',
-        vendor: 'Namron',
+        vendor: 'Namron', // Sunricher SR-ZG9032A
         description: 'Namron multi sensor',
         fromZigbee: [fz.battery, fz.ignore_basic_report, fz.ias_occupancy_alarm_1, fz.temperature, fz.humidity, fz.occupancy_timeout,
         fz.illuminance],
