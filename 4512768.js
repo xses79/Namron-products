@@ -14,7 +14,7 @@ module.exports = [
         model: '4512768',
         vendor: 'Namron',
         description: 'Zigbee 2 channel switch Namron',
-        fromZigbee: [fz.on_off, fz.electrical_measurement, fz.metering, fz.power_on_behavior, fz.ignore_genOta,],
+        fromZigbee: [fz.on_off, fz.electrical_measurement, fz.metering, fz.power_on_behavior, fz.ignore_genOta],
         toZigbee: [tz.on_off, tz.power_on_behavior],
         exposes: [
             e.switch().withEndpoint('l1'),
@@ -30,7 +30,7 @@ module.exports = [
             e.numeric('power_l2', ea.STATE).withUnit('W').withDescription('Phase 2 power'),
         ],
         endpoint: (device) => {
-            const endpoints = {'l1': 1};
+            const endpoints = { 'l1': 1 };
             if (device.getEndpoint(2)) {
                 endpoints['l2'] = 2;
             }
@@ -49,8 +49,12 @@ module.exports = [
                 await reporting.onOff(endpoint2);
                 await reporting.currentSummDelivered(endpoint2);
                 await reporting.readEletricalMeasurementMultiplierDivisors(endpoint2);
+                // Add reporting for total power consumption
+                await reporting.currentSummDelivered(endpoint1, { min: 10, changes: 10 });
+                await reporting.currentSummDelivered(endpoint2, { min: 10, changes: 10 });
             }
         },
     },
 ];
+
 
