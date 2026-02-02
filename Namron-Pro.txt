@@ -1,0 +1,467 @@
+const fz = require('zigbee-herdsman-converters/converters/fromZigbee');
+const tz = require('zigbee-herdsman-converters/converters/toZigbee');
+const exposes = require('zigbee-herdsman-converters/lib/exposes');
+const reporting = require('zigbee-herdsman-converters/lib/reporting');
+
+const e = exposes.presets;
+const ea = exposes.access;
+
+const MANUF_CODE = 0x1224;
+
+// Z2M external converters har ikke alltid logger.debug(). Gjør logging robust.
+const logDebug = (logger, msg) => {
+    try {
+        if (logger && typeof logger.debug === 'function') return logger.debug(msg);
+        if (logger && typeof logger.info === 'function') return logger.info(msg);
+        if (typeof console !== 'undefined' && typeof console.debug === 'function') return console.debug(msg);
+        if (typeof console !== 'undefined' && typeof console.log === 'function') return console.log(msg);
+    } catch (e) {
+        // no-op
+    }
+};
+
+// -------------------------------------------------------------
+// FROMZIGBEE – Ekstra attributter fra ovnen
+// -------------------------------------------------------------
+const fzLocal = {
+    namron_panel_heater_extra: {
+        cluster: 'hvacThermostat',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            const data = msg.data;
+            const result = {};
+
+            if (data[0x100A] != null) result.hysteresis = data[0x100A] / 10.0;
+            if (data[0x1009] != null) result.window_open_detection = (data[0x1009] === 0);
+            if (data[0x100B] != null) result.window_open = (data[0x100B] === 1);
+            if (data[0x1000] != null) result.display_brightness = data[0x1000];
+            if (data[0x1001] != null) result.display_auto_off = (data[0x1001] === 1);
+            if (data[0x2009] != null) result.control_method = data[0x2009] === 0 ? 'pid' : 'hysteresis';
+            if (data[0x100C] != null) result.adaptive_function = (data[0x100C] === 0);
+
+            if (data[0x2006] != null) result.pid_kp = data[0x2006] / 1000.0;
+            if (data[0x2008] != null) result.pid_ki = data[0x2008] / 1000.0;
+            if (data[0x2007] != null) result.pid_kd = data[0x2007] / 1000.0;
+
+            if (data.systemMode != null) {
+                const sm = data.systemMode;
+                result.system_mode =
+                    sm === 0x00 ? 'off' :
+                    sm === 0x01 ? 'auto' :
+                    sm === 0x04 ? 'heat' :
+                    sm === 0x09 ? 'sleep' : sm;
+
+                result.state = (sm === 0x00) ? 'OFF' : 'ON';
+            }
+
+            return result;
+        },
+    },
+};
+
+// -------------------------------------------------------------
+// TOZIGBEE – Lokale handlinger
+// -------------------------------------------------------------
+const tzLocal = {
+    namron_panel_heater_state: {
+        key: ['state'],
+        convertSet: async (entity, key, value) => {
+            const v = String(value).toUpperCase();
+            const isOn = v === 'ON';
+            const systemMode = isOn ? 0x04 : 0x00;
+
+            await entity.write('hvacThermostat', {systemMode}, {disableDefaultResponse: true});
+            return {state: {state: isOn ? 'ON' : 'OFF'}};
+        },
+        convertGet: async (entity) => {
+            await entity.read('hvacThermostat', ['systemMode']);
+        },
+    },
+
+    namron_panel_heater_frost_mode: {
+        key: ['frost_mode'],
+        convertSet: async (entity, key, value, meta) => {
+            const enable = value === true || String(value).toUpperCase() === 'ON';
+
+            if (enable) {
+                if (meta.state) {
+                    if (meta.state._prev_system_mode === undefined && meta.state.system_mode !== undefined) {
+                        meta.state._prev_system_mode = meta.state.system_mode;
+                    }
+                    if (meta.state._prev_occupied_heating_setpoint === undefined &&
+                        meta.state.occupied_heating_setpoint !== undefined) {
+                        meta.state._prev_occupied_heating_setpoint = meta.state.occupied_heating_setpoint;
+                    }
+                }
+
+                await entity.write(
+                    'hvacThermostat',
+                    {systemMode: 0x04, occupiedHeatingSetpoint: 700},
+                    {disableDefaultResponse: true},
+                );
+            } else {
+                let payload = {};
+
+                if (meta.state) {
+                    if (meta.state._prev_system_mode !== undefined) {
+                        let sm = meta.state._prev_system_mode;
+                        let smVal;
+
+                        if (typeof sm === 'number') {
+                            smVal = sm;
+                        } else {
+                            sm = String(sm);
+                            if (sm === 'off') smVal = 0x00;
+                            else if (sm === 'auto') smVal = 0x01;
+                            else if (sm === 'heat') smVal = 0x04;
+                            else if (sm === 'sleep') smVal = 0x09;
+                        }
+
+                        if (smVal !== undefined) payload.systemMode = smVal;
+                    }
+
+                    if (meta.state._prev_occupied_heating_setpoint !== undefined) {
+                        let sp = meta.state._prev_occupied_heating_setpoint;
+                        if (typeof sp === 'number' && sp < 100) sp = Math.round(sp * 100);
+                        payload.occupiedHeatingSetpoint = sp;
+                    }
+
+                    delete meta.state._prev_system_mode;
+                    delete meta.state._prev_occupied_heating_setpoint;
+                }
+
+                if (Object.keys(payload).length === 0) {
+                    payload = {systemMode: 0x04, occupiedHeatingSetpoint: 2100};
+                }
+
+                await entity.write('hvacThermostat', payload, {disableDefaultResponse: true});
+            }
+
+            return {state: {frost_mode: enable}};
+        },
+    },
+
+    namron_panel_heater_hysteresis: {
+        key: ['hysteresis'],
+        convertSet: async (entity, key, value) => {
+            let num = Number(value);
+            if (Number.isNaN(num)) return;
+            if (num < 0.5) num = 0.5;
+            if (num > 5.0) num = 5.0;
+
+            const raw = Math.round(num * 10);
+
+            await entity.write(
+                'hvacThermostat',
+                {0x100A: {value: raw, type: 0x20}},
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+
+            return {state: {hysteresis: num}};
+        },
+        convertGet: async (entity) => {
+            await entity.read('hvacThermostat', [0x100A], {manufacturerCode: MANUF_CODE});
+        },
+    },
+
+    namron_panel_heater_window_open: {
+        key: ['window_open_detection'],
+        convertSet: async (entity, key, value) => {
+            const enable = value === true || String(value).toUpperCase() === 'ON';
+            const raw = enable ? 0 : 1;
+
+            await entity.write(
+                'hvacThermostat',
+                {0x1009: {value: raw, type: 0x30}},
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+            return {state: {window_open_detection: enable}};
+        },
+        convertGet: async (entity) => {
+            await entity.read(
+                'hvacThermostat',
+                [0x1009, 0x100B],
+                {manufacturerCode: MANUF_CODE},
+            );
+        },
+    },
+
+    namron_panel_heater_pid_kp: {
+        key: ['pid_kp'],
+        convertSet: async (entity, key, value) => {
+            let num = Number(value);
+            if (Number.isNaN(num)) return;
+            num = Math.min(Math.max(num, 0), 1);
+
+            await entity.write(
+                'hvacThermostat',
+                {0x2006: {value: Math.round(num * 1000), type: 0x21}},
+                {manufacturerCode: MANUF_CODE},
+            );
+            return {state: {pid_kp: num}};
+        },
+        convertGet: async (entity) => {
+            await entity.read('hvacThermostat', [0x2006], {manufacturerCode: MANUF_CODE});
+        },
+    },
+
+    namron_panel_heater_pid_ki: {
+        key: ['pid_ki'],
+        convertSet: async (entity, key, value) => {
+            let num = Number(value);
+            if (Number.isNaN(num)) return;
+            num = Math.min(Math.max(num, 0), 1);
+
+            await entity.write(
+                'hvacThermostat',
+                {0x2008: {value: Math.round(num * 1000), type: 0x21}},
+                {manufacturerCode: MANUF_CODE},
+            );
+            return {state: {pid_ki: num}};
+        },
+        convertGet: async (entity) => {
+            await entity.read('hvacThermostat', [0x2008], {manufacturerCode: MANUF_CODE});
+        },
+    },
+
+    namron_panel_heater_pid_kd: {
+        key: ['pid_kd'],
+        convertSet: async (entity, key, value) => {
+            let num = Number(value);
+            if (Number.isNaN(num)) return;
+            num = Math.min(Math.max(num, 0), 1);
+
+            await entity.write(
+                'hvacThermostat',
+                {0x2007: {value: Math.round(num * 1000), type: 0x21}},
+                {manufacturerCode: MANUF_CODE},
+            );
+            return {state: {pid_kd: num}};
+        },
+        convertGet: async (entity) => {
+            await entity.read('hvacThermostat', [0x2007], {manufacturerCode: MANUF_CODE});
+        },
+    },
+
+    namron_panel_heater_display_auto_off: {
+        key: ['display_auto_off'],
+        convertSet: async (entity, key, value) => {
+            const enable = value === true || String(value).toUpperCase() === 'ON';
+            const raw = enable ? 1 : 0;
+
+            await entity.write(
+                'hvacThermostat',
+                {0x1001: {value: raw, type: 0x30}},
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+
+            return {state: {display_auto_off: enable}};
+        },
+        convertGet: async (entity) => {
+            await entity.read(
+                'hvacThermostat',
+                [0x1001],
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+        },
+    },
+
+    namron_panel_heater_control_method: {
+        key: ['control_method'],
+        convertSet: async (entity, key, value) => {
+            let mode = String(value).toLowerCase();
+            let raw;
+            if (mode === 'pid' || mode === '0') raw = 0;
+            else if (mode === 'hysteresis' || mode === '1') raw = 1;
+            else return;
+
+            await entity.write(
+                'hvacThermostat',
+                {0x2009: {value: raw, type: 0x30}},
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+
+            return {state: {control_method: raw === 0 ? 'pid' : 'hysteresis'}};
+        },
+        convertGet: async (entity) => {
+            await entity.read(
+                'hvacThermostat',
+                [0x2009],
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+        },
+    },
+
+    namron_panel_heater_adaptive_function: {
+        key: ['adaptive_function'],
+        convertSet: async (entity, key, value) => {
+            const enable = value === true || String(value).toUpperCase() === 'ON';
+            const raw = enable ? 0 : 1;
+
+            await entity.write(
+                'hvacThermostat',
+                {0x100C: {value: raw, type: 0x30}},
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+
+            return {state: {adaptive_function: enable}};
+        },
+        convertGet: async (entity) => {
+            await entity.read(
+                'hvacThermostat',
+                [0x100C],
+                {manufacturerCode: MANUF_CODE, disableDefaultResponse: true},
+            );
+        },
+    },
+};
+
+// -------------------------------------------------------------
+// DEVICE DEFINITION
+// -------------------------------------------------------------
+const definition = {
+    zigbeeModel: ['Panel Heater'],
+    model: '4512776',
+    vendor: 'NAMRON AS',
+    description: 'Namron Zigbee panelovn PRO 16A hvit (4512776) / sort (4512777)',
+
+    whiteLabel: [
+        {
+            vendor: 'NAMRON AS',
+            model: '4512777',
+            description: 'Auto - Namron Zigbee panelovn PRO 16A sort (4512777)',
+        },
+    ],
+
+    fromZigbee: [
+        fz.thermostat,
+        fz.metering,
+        fz.electrical_measurement,
+        fzLocal.namron_panel_heater_extra,
+    ],
+
+    toZigbee: [
+        tz.thermostat_occupied_heating_setpoint,
+        tz.thermostat_local_temperature_calibration,
+        tz.thermostat_system_mode,
+
+        tzLocal.namron_panel_heater_state,
+        tzLocal.namron_panel_heater_frost_mode,
+        tzLocal.namron_panel_heater_hysteresis,
+        tzLocal.namron_panel_heater_window_open,
+        tzLocal.namron_panel_heater_pid_kp,
+        tzLocal.namron_panel_heater_pid_ki,
+        tzLocal.namron_panel_heater_pid_kd,
+        tzLocal.namron_panel_heater_display_auto_off,
+        tzLocal.namron_panel_heater_control_method,
+        tzLocal.namron_panel_heater_adaptive_function,
+    ],
+
+    exposes: [
+        e.climate()
+            .withLocalTemperature()
+            .withSetpoint('occupied_heating_setpoint', 5, 35, 0.5)
+            .withLocalTemperatureCalibration(-25, 25, 0.5)
+            .withSystemMode(['off', 'heat', 'auto'])
+            .withRunningState(['idle', 'heat']),
+
+        e.binary('state', ea.ALL, 'ON', 'OFF')
+            .withDescription('Virtuell av/på (map til systemMode)'),
+
+        e.binary('frost_mode', ea.ALL, true, false)
+            .withDescription('Frostsikring: HEAT + 7°C, gjenoppretter tidligere modus/setpunkt'),
+
+        e.numeric('hysteresis', ea.ALL)
+            .withValueMin(0.5).withValueMax(5.0).withValueStep(0.1)
+            .withUnit('°C'),
+
+        e.binary('window_open_detection', ea.ALL, true, false),
+        e.binary('window_open', ea.STATE, true, false),
+
+        e.numeric('pid_kp', ea.ALL).withValueMin(0).withValueMax(1).withValueStep(0.01),
+        e.numeric('pid_ki', ea.ALL).withValueMin(0).withValueMax(1).withValueStep(0.01),
+        e.numeric('pid_kd', ea.ALL).withValueMin(0).withValueMax(1).withValueStep(0.01),
+
+        e.enum('control_method', ea.ALL, ['pid', 'hysteresis']),
+
+        e.binary('adaptive_function', ea.ALL, true, false),
+
+        e.numeric('display_brightness', ea.STATE)
+            .withValueMin(1).withValueMax(7).withValueStep(1),
+
+        e.binary('display_auto_off', ea.ALL, true, false),
+
+        e.power(),
+        e.energy(),
+    ],
+
+    configure: async (device, coordinatorEndpoint, logger) => {
+        const endpoint = device.getEndpoint(1);
+
+        await reporting.bind(endpoint, coordinatorEndpoint, [
+            'genBasic',
+            'genIdentify',
+            'hvacThermostat',
+            'seMetering',
+            'haElectricalMeasurement',
+        ]);
+
+        // === Viktig: hent multiplier/divisor så energien skaleres riktig ===
+        try {
+            await endpoint.read('seMetering', [
+                'multiplier',
+                'divisor',
+                'unitOfMeasure',
+                'summationFormatting',
+            ]);
+        } catch (e) {
+            logDebug(logger, `Metering multiplier/divisor read error: ${e}`);
+        }
+
+        try {
+            await endpoint.read('haElectricalMeasurement', [
+                'acPowerMultiplier', 'acPowerDivisor',
+                'acVoltageMultiplier', 'acVoltageDivisor',
+                'acCurrentMultiplier', 'acCurrentDivisor',
+            ]);
+        } catch (e) {
+            logDebug(logger, `Electrical measurement multiplier/divisor read error: ${e}`);
+        }
+
+        await reporting.thermostatTemperature(endpoint, {min: 0, change: 50});
+        await reporting.thermostatOccupiedHeatingSetpoint(endpoint);
+
+        await endpoint.read('hvacThermostat', [
+            'localTemperature',
+            'occupiedHeatingSetpoint',
+            'systemMode',
+        ]);
+
+        try {
+            await endpoint.read('haElectricalMeasurement', ['activePower']);
+        } catch (e) {
+            logDebug(logger, `ActivePower read error: ${e}`);
+        }
+
+        try {
+            await endpoint.read('seMetering', ['currentSummDelivered']);
+        } catch (e) {
+            logDebug(logger, `Metering read error: ${e}`);
+        }
+
+        try {
+            await endpoint.read(
+                'hvacThermostat',
+                [0x1000, 0x1001, 0x1009, 0x100A, 0x100B, 0x100C, 0x2006, 0x2007, 0x2008, 0x2009],
+                {manufacturerCode: MANUF_CODE},
+            );
+        } catch (e) {
+            logDebug(logger, `Extra thermostat attrs error: ${e}`);
+        }
+
+        device.powerSource = 'Mains (single phase)';
+        device.save();
+    },
+};
+
+module.exports = [definition];
